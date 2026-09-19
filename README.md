@@ -38,7 +38,7 @@ inspection. Until then every row is an intention, not a result.
 | `fence-prospecting.agent.yaml` | Agent: model, tool surface, system prompt |
 | `fence-prospecting.environment.yaml` | Sandbox: cloud, deny-by-default container egress |
 | `rubric.md` | The 11 graded criteria for the first test |
-| `agent.py` | All operations: setup, launch, watch, results, update-agent |
+| `agent.py` | All operations: preflight, setup, verify, launch, watch, results, update-agent |
 | `ghl-import-mapping.md` | Proposed CSV → GoHighLevel mapping, unverified against a live location |
 
 `.ids.json` (the created object IDs), `.last-session`, and `deliverables/` are gitignored.
@@ -109,19 +109,40 @@ Only the **research-history store** is `read_write`, because deduplication needs
 
 ## Beta headers
 
-Memory store and memory endpoints take `agent-memory-2026-07-22`. Agents, environments, and
-sessions — including attaching a memory store to a session — take
-`managed-agents-2026-04-01`. **Sending both on a memory-store request returns HTTP 400.**
-`agent.py` routes the header by endpoint in `beta_for()` and refuses to combine them.
+One header covers the whole Managed Agents surface — agents, environments, sessions, **and**
+memory stores and memories: `managed-agents-2026-04-01`. The Files endpoints add
+`files-api-2025-04-14` alongside it.
+
+An earlier revision of this file claimed memory endpoints took a separate
+`agent-memory-2026-07-22` header and that combining the two returned HTTP 400. That was
+wrong on both counts: no such beta appears in the Managed Agents endpoint reference, and the
+SDKs send `managed-agents-2026-04-01` for their `memory_stores` calls. `agent.py` had been
+routing memory requests to the invented header, so `setup` could not get past its first
+`/memory_stores` call. `beta_for()` now sends the one header and refuses any `agent-memory`
+variant outright; `py agent.py preflight` asserts that routing offline.
 
 ## Sequence
 
 ```powershell
+py agent.py preflight          # validates config offline. No key, no network, no cost.
 py agent.py setup              # creates agent + environment + 2 stores -> .ids.json. No model cost.
+py agent.py verify             # reads those objects back and checks them. No model cost.
 py agent.py launch --confirm   # BILLABLE: one session, $8.00 cap
 py agent.py watch              # poll until it stops, and see why it stopped
 py agent.py results            # actual cost + download deliverables
 ```
+
+`setup` is resumable. Every ID is written to `.ids.json` the moment its object exists, so a
+run that fails partway records what it already made; re-running reuses those objects instead
+of orphaning them and creating a second set. Seeding is idempotent — an occupied memory path
+returns `409 memory_path_conflict_error`, which `setup` reports as `present` rather than
+overwriting.
+
+`verify` reads the agent, the environment, both stores, and their seeded records back from
+the API, and checks the session configuration `launch` would send — that the reference store
+attaches `read_only`, the research history attaches `read_write`, and Summit stays an
+existing-client reference with no outreach. It validates that body without creating a
+session, because creating one is billable.
 
 `launch` without `--confirm` explains the cost and exits without starting anything.
 

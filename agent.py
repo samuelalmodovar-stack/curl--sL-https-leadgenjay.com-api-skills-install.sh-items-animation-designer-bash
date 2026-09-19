@@ -9,6 +9,8 @@ pyyaml to read the two config files — no CLI, no SDK.
   py agent.py watch            poll until the session stops, and say why
   py agent.py results          actual cost + download deliverables
   py agent.py update-agent     apply a YAML edit as a new agent version
+  py agent.py preflight        validate config offline                  (no key, no network)
+  py agent.py verify           read the created objects back and check them
 """
 
 import argparse
@@ -30,12 +32,18 @@ RUBRIC = ROOT / "rubric.md"
 
 BASE = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
 
-# Beta headers are NOT interchangeable and must never be combined on one request.
-# Agents, environments, sessions (including attaching a memory store to a session):
+# One beta header covers the whole Managed Agents surface: agents, environments,
+# sessions, AND memory stores and memories. Per the Managed Agents endpoint reference,
+# every one of those endpoints takes `managed-agents-2026-04-01`, and the SDKs send that
+# same header for their memory_stores calls. There is no separate memory beta.
 BETA = "managed-agents-2026-04-01"
-# Memory store and memory endpoints. Sending this together with BETA returns HTTP 400.
-MEMORY_BETA = "agent-memory-2026-07-22"
+# The Files endpoints carry their own beta alongside it.
 FILES_BETA = f"{BETA},files-api-2025-04-14"
+
+# Header fragments this tool must never send. An earlier revision routed memory-store
+# requests to `agent-memory-2026-07-22`, which is not a documented beta — that split is
+# what made `setup` fail at the first memory_stores call.
+BAD_BETA_FRAGMENTS = ("agent-memory",)
 
 # $8.00, in minor units as an integer string — the API rejects decimal forms.
 BUDGET_CENTS = "800"
@@ -66,15 +74,15 @@ def api_key():
 
 
 def beta_for(path, override=None):
-    """Pick the beta header by endpoint family, so the two can never be combined."""
-    if path.startswith("/memory_stores"):
-        if override and "managed-agents" in override:
+    """Pick the beta header by endpoint family."""
+    beta = override or (FILES_BETA if path.startswith("/files") else BETA)
+    for bad in BAD_BETA_FRAGMENTS:
+        if bad in beta:
             raise ApiError(
-                f"refusing to send '{override}' to {path} — memory store requests take "
-                f"{MEMORY_BETA} alone; combining the two returns HTTP 400"
+                f"refusing to send '{beta}' to {path} — the Managed Agents surface, "
+                f"memory stores included, takes '{BETA}'"
             )
-        return override or MEMORY_BETA
-    return override or BETA
+    return beta
 
 
 def request(method, path, body=None, beta=None, query=None):
@@ -218,87 +226,99 @@ read-only reference store and are changed through the API, not by a session."""
 }
 
 
-def cmd_setup(args):
-    if IDS_FILE.exists():
-        die(
-            f"{IDS_FILE.name} already exists — these objects were created already.\n"
-            "Edited the YAML? Run `py agent.py update-agent` instead."
+REFERENCE_STORE = {
+    "name": "Samuel Scales Marketing - Reference",
+    "description": (
+        "Offer brief, partial user-confirmed prospecting exclusions, and existing-client "
+        "reference records including Summit Fencing LLC. Read this before researching or "
+        "including any company. Read-only: it is maintained outside the session. The "
+        "exclusion information is NOT reconciled against the CRM and is not a complete "
+        "list of who must be excluded."
+    ),
+}
+
+HISTORY_STORE = {
+    "name": "Samuel Scales Marketing - Research History",
+    "description": (
+        "One record per company considered — verified, rejected, incomplete, excluded, "
+        "reference — so later runs neither repeat the research nor re-approach a company. "
+        "Deduplicate by normalized company domain and business identity. Research, "
+        "qualification, and contact dispositions stay separate."
+    ),
+}
+
+
+def save_ids(ids):
+    IDS_FILE.write_text(json.dumps(ids, indent=2) + "\n")
+
+
+def seed_memory(store_id, path, content):
+    """Create one memory, treating an already-occupied path as already seeded.
+
+    The API returns 409 memory_path_conflict_error when `path` exists, which is what
+    makes re-running `setup` safe: seeding never duplicates and never overwrites.
+    """
+    try:
+        request(
+            "POST", f"/memory_stores/{store_id}/memories", {"path": path, "content": content}
         )
+        return "seeded "
+    except ApiError as e:
+        if "memory_path_conflict" in str(e):
+            return "present"
+        raise
 
-    print("==> Creating agent")
-    agent = request("POST", "/agents", load_yaml(AGENT_YAML))
-    print(f"    {agent['id']} (version {agent.get('version')})")
 
-    print("==> Creating environment")
-    env = request("POST", "/environments", load_yaml(ENV_YAML))
-    print(f"    {env['id']}")
+def cmd_setup(args):
+    """Create the four objects and seed the two stores. Resumable and idempotent.
 
+    Each ID is written to .ids.json the moment its object exists, so a call that fails
+    partway leaves a record of what was already created. Re-running reuses those objects
+    instead of orphaning them and creating a second set.
+    """
+    ids = {}
+    if IDS_FILE.exists():
+        ids = json.loads(IDS_FILE.read_text())
+        print(f"==> Found {IDS_FILE.name} — reusing the objects recorded in it")
+
+    def ensure(key, label, body_or_path):
+        if ids.get(key):
+            print(f"==> {label}: reusing {ids[key]}")
+            return ids[key]
+        print(f"==> Creating {label}")
+        path, body = body_or_path
+        obj = request("POST", path, body() if callable(body) else body)
+        ids[key] = obj["id"]
+        save_ids(ids)  # checkpoint before anything else can fail
+        print(f"    {obj['id']}" + (f" (version {obj['version']})" if obj.get("version") else ""))
+        return obj["id"]
+
+    agent_id = ensure("agent_id", "agent", ("/agents", lambda: load_yaml(AGENT_YAML)))
+    ensure("environment_id", "environment", ("/environments", lambda: load_yaml(ENV_YAML)))
     # Two stores on purpose. The agent reads untrusted web pages, so a prompt injection
     # could otherwise write to the exclusions or Summit's designation and a later session
     # would read that back as trusted memory. Reference material is attached read_only and
     # is only ever changed through the API.
-    print("==> Creating reference store (attached read-only)")
-    ref = request(
-        "POST",
-        "/memory_stores",
-        {
-            "name": "Samuel Scales Marketing - Reference",
-            "description": (
-                "Offer brief, partial user-confirmed prospecting exclusions, and "
-                "existing-client reference records including Summit Fencing LLC. Read this "
-                "before researching or including any company. Read-only: it is maintained "
-                "outside the session. The exclusion information is NOT reconciled against "
-                "the CRM and is not a complete list of who must be excluded."
-            ),
-        },
+    ref_id = ensure(
+        "reference_store_id", "reference store (attached read-only)",
+        ("/memory_stores", REFERENCE_STORE),
     )
-    print(f"    {ref['id']}")
-
-    print("==> Creating research-history store (attached read-write)")
-    hist = request(
-        "POST",
-        "/memory_stores",
-        {
-            "name": "Samuel Scales Marketing - Research History",
-            "description": (
-                "One record per company considered — verified, rejected, incomplete, "
-                "excluded, reference — so later runs neither repeat the research nor "
-                "re-approach a company. Deduplicate by normalized company domain and "
-                "business identity. Research, qualification, and contact dispositions stay "
-                "separate."
-            ),
-        },
+    hist_id = ensure(
+        "history_store_id", "research-history store (attached read-write)",
+        ("/memory_stores", HISTORY_STORE),
     )
-    print(f"    {hist['id']}")
 
-    print("==> Seeding the reference store")
-    for path, content in REFERENCE_SEEDS.items():
-        request(
-            "POST", f"/memory_stores/{ref['id']}/memories", {"path": path, "content": content}
-        )
-        print(f"    seeded {path}")
+    for store_id, label, seeds in (
+        (ref_id, "reference", REFERENCE_SEEDS),
+        (hist_id, "research-history", RESEARCH_SEED),
+    ):
+        print(f"==> Seeding the {label} store")
+        for path, content in seeds.items():
+            print(f"    {seed_memory(store_id, path, content)} {path}")
 
-    print("==> Seeding the research-history store")
-    for path, content in RESEARCH_SEED.items():
-        request(
-            "POST", f"/memory_stores/{hist['id']}/memories", {"path": path, "content": content}
-        )
-        print(f"    seeded {path}")
-
-    IDS_FILE.write_text(
-        json.dumps(
-            {
-                "agent_id": agent["id"],
-                "environment_id": env["id"],
-                "reference_store_id": ref["id"],
-                "history_store_id": hist["id"],
-            },
-            indent=2,
-        )
-        + "\n"
-    )
     print(f"\nIDs written to {IDS_FILE.name}. No session started, no model cost incurred.")
-    print("Next, when you are ready to authorize the test: py agent.py launch --confirm")
+    print("Confirm what exists:  py agent.py verify")
+    print("Then, when you are ready to authorize the test: py agent.py launch --confirm")
 
 
 # -------------------------------------------------------------------------- launch
@@ -505,6 +525,198 @@ def cmd_update_agent(args):
     print("\nRunning sessions keep the version they started on; new sessions get this one.")
 
 
+# ------------------------------------------------------------------ verify/preflight
+
+EXPECTED_SEEDS = {
+    "reference_store_id": sorted(REFERENCE_SEEDS),
+    "history_store_id": sorted(RESEARCH_SEED),
+}
+
+
+def flat(text):
+    """Normalize for substring checks: collapse whitespace, fold case.
+
+    Seeds and the rubric are prose that wraps, so a literal substring match would fail
+    on a line break or a capitalized word rather than on missing content.
+    """
+    return " ".join(text.split()).lower()
+
+
+class Checks:
+    def __init__(self):
+        self.failed = []
+
+    def __call__(self, ok, label, detail=""):
+        print(f"  [{'OK  ' if ok else 'FAIL'}] {label}" + (f" — {detail}" if detail else ""))
+        if not ok:
+            self.failed.append(label)
+        return ok
+
+    def report(self, what):
+        if self.failed:
+            print(f"\n{len(self.failed)} {what} check(s) FAILED:")
+            for f in self.failed:
+                print(f"  - {f}")
+            sys.exit(1)
+        print(f"\nAll {what} checks passed.")
+
+
+def check_session_config(chk, ids):
+    """The session configuration is validated, never created — creating one is billable.
+
+    This is the body `launch` would POST, so what it asserts is what a run would carry.
+    """
+    body = session_body(ids)
+    by_id = {r["memory_store_id"]: r for r in body["resources"]}
+    ref = by_id.get(ids["reference_store_id"], {})
+    hist = by_id.get(ids["history_store_id"], {})
+    chk(len(body["resources"]) == 2, "session attaches exactly 2 memory stores")
+    chk(ref.get("access") == "read_only",
+        "reference store attached read_only", ref.get("access", "missing"))
+    chk(hist.get("access") == "read_write",
+        "research history attached read_write", hist.get("access", "missing"))
+    chk(all(r.get("type") == "memory_store" for r in body["resources"]),
+        "both resources are memory_store resources")
+    budget = body["budget"]["max_list_cost"]
+    chk(budget["amount"].isdigit() and budget["currency"] == "USD",
+        "budget is an integer-string minor-unit USD cap", money(budget["amount"], "USD"))
+    ev = body["initial_events"][0]
+    chk(ev["type"] == "user.define_outcome" and ev.get("rubric", {}).get("content"),
+        "kickoff is a single user.define_outcome carrying the rubric")
+    desc = ev["description"]
+    chk("Summit Fencing LLC existing-client reference" in desc,
+        "outcome names Summit as an existing-client reference")
+    chk("no outreach drafts" in desc and "acquisition import" in desc,
+        "outcome keeps Summit out of outreach and acquisition import")
+
+
+def cmd_preflight(args):
+    """Offline validation. Needs no API key, makes no network call, costs nothing."""
+    chk = Checks()
+
+    print("==> Config files parse")
+    agent = load_yaml(AGENT_YAML)
+    env = load_yaml(ENV_YAML)
+    chk(bool(agent.get("system")), "agent.yaml has a system prompt")
+    chk(agent.get("model") == "claude-opus-5", "agent model", str(agent.get("model")))
+    toolsets = [t for t in agent.get("tools") or [] if t.get("type") == "agent_toolset_20260401"]
+    chk(len(toolsets) == 1, "exactly one agent_toolset_20260401")
+    configs = {c.get("name"): c for c in (toolsets[0].get("configs") if toolsets else [])}
+    chk(configs.get("bash", {}).get("enabled") is False, "bash disabled in the agent toolset")
+    chk(configs.get("web_fetch", {}).get("permission_policy", {}).get("type") == "auto",
+        "web_fetch runs under the auto permission policy")
+    chk((env.get("config") or {}).get("networking", {}).get("type") == "limited",
+        "environment egress is deny-by-default (limited)")
+
+    print("==> Beta header routing")
+    chk(beta_for("/memory_stores") == BETA, "memory_stores uses the managed-agents beta", BETA)
+    chk(beta_for("/agents") == BETA, "agents uses the managed-agents beta")
+    chk(beta_for("/files") == FILES_BETA, "files adds the files beta")
+    try:
+        beta_for("/memory_stores", "agent-memory-2026-07-22")
+        chk(False, "an undocumented memory beta is refused")
+    except ApiError:
+        chk(True, "an undocumented memory beta is refused")
+
+    print("==> Session configuration (validated, not created)")
+    check_session_config(chk, {k: f"<{k}>" for k in
+                               ("agent_id", "environment_id",
+                                "reference_store_id", "history_store_id")})
+
+    print("==> Summit handling across the seeds and rubric")
+    ref = "\n".join(REFERENCE_SEEDS.values())
+    chk("Summit Fencing LLC is NOT an exclusion" in ref,
+        "exclusion seed states Summit is not an exclusion")
+    chk("relationship=existing_client" in ref, "reference seed sets relationship=existing_client")
+    chk("Never generate acquisition outreach" in ref, "reference seed forbids acquisition outreach")
+    chk("Samuel Scales Marketing" in ref and "Drone Syndrome Media" in ref,
+        "both confirmed exclusions are seeded")
+    chk("not been reconciled against the crm" in flat(ref),
+        "exclusions are seeded as PARTIAL")
+    rubric = flat(RUBRIC.read_text(encoding="utf-8"))
+    chk("existing client — no acquisition outreach" in rubric, "rubric grades Summit's label")
+    chk("summit has **no** outreach drafts" in rubric, "rubric grades no drafts for Summit")
+
+    chk.report("preflight")
+    print("This validates configuration only. Nothing was created and no key was used.")
+
+
+def list_memory_paths(store_id):
+    """Flat list of memory paths in a store, walking prefix nodes."""
+    paths, queue, seen = [], ["/"], set()
+    while queue:
+        prefix = queue.pop(0)
+        if prefix in seen:
+            continue
+        seen.add(prefix)
+        after = None
+        while True:
+            query = {"path_prefix": prefix, "view": "basic", "limit": 100}
+            if after:
+                query["after_id"] = after
+            page = request("GET", f"/memory_stores/{store_id}/memories", query=query)
+            items = page.get("data") or []
+            for item in items:
+                if item.get("type") == "memory_prefix":
+                    queue.append(item["path"].rstrip("/") + "/")
+                elif item.get("path"):
+                    paths.append(item["path"])
+            if not page.get("has_more") or not page.get("last_id"):
+                break
+            after = page["last_id"]
+    return sorted(set(paths))
+
+
+def cmd_verify(args):
+    """Confirm what actually exists, by reading it back from the API."""
+    ids = load_ids()
+    chk = Checks()
+
+    print("==> Agent")
+    agent = request("GET", f"/agents/{ids['agent_id']}")
+    print(f"    {agent['id']}  version {agent.get('version')}")
+    model = agent.get("model")
+    chk(bool(agent.get("id")), "agent exists", agent["id"])
+    chk((model if isinstance(model, str) else (model or {}).get("id")) == "claude-opus-5",
+        "agent model is claude-opus-5")
+    system = flat(agent.get("system") or "")
+    chk("summit fencing llc is an existing client" in system,
+        "system prompt carries the Summit existing-client rule")
+    chk("never generate acquisition outreach for it" in system,
+        "system prompt forbids acquisition outreach for Summit")
+
+    print("==> Environment")
+    env = request("GET", f"/environments/{ids['environment_id']}")
+    cfg = env.get("config") or {}
+    print(f"    {env['id']}")
+    chk(cfg.get("type") == "cloud", "environment is a cloud sandbox", str(cfg.get("type")))
+    chk((cfg.get("networking") or {}).get("type") == "limited",
+        "container egress is deny-by-default")
+
+    print("==> Memory stores")
+    for key, label in (("reference_store_id", "reference"),
+                       ("history_store_id", "research history")):
+        store = request("GET", f"/memory_stores/{ids[key]}")
+        print(f"    {label}: {store['id']}  {store.get('name')}")
+        chk(bool(store.get("id")), f"{label} store exists", store["id"])
+        chk(not store.get("archived_at"), f"{label} store is not archived")
+
+    print("==> Seeded records")
+    for key, expected in EXPECTED_SEEDS.items():
+        found = list_memory_paths(ids[key])
+        for path in expected:
+            chk(path in found, f"{key}: {path}")
+        extra = sorted(set(found) - set(expected))
+        if extra:
+            print(f"    note: {len(extra)} additional record(s) present: {', '.join(extra)}")
+
+    print("==> Session configuration (validated, not created)")
+    check_session_config(chk, ids)
+
+    chk.report("verification")
+    print("No session was created and no model cost was incurred by this command.")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -523,6 +735,8 @@ def main():
     results.add_argument("--out", default="deliverables")
 
     sub.add_parser("update-agent", help="apply a YAML edit as a new agent version")
+    sub.add_parser("preflight", help="offline config validation (no key, no network)")
+    sub.add_parser("verify", help="read the created objects back and check them")
 
     args = p.parse_args()
     handlers = {
@@ -531,6 +745,8 @@ def main():
         "watch": cmd_watch,
         "results": cmd_results,
         "update-agent": cmd_update_agent,
+        "preflight": cmd_preflight,
+        "verify": cmd_verify,
     }
     try:
         handlers[args.cmd](args)
