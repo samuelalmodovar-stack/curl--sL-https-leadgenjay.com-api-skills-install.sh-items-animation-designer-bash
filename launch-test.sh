@@ -6,18 +6,18 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 [ -f .ids.env ] || { echo "ERROR: run ./setup.sh first."; exit 1; }
-source .ids.env
+source ./.ids.env
 
 if [ "${CONFIRM_PAID_RUN:-}" != "yes" ]; then
-  echo "This starts a billable session (cap \$8.00, may overrun by up to one model request)."
+  echo "This starts a billable session: \$8.00 cap, which one in-flight model request can"
+  echo "overrun by a fraction of a dollar. Nothing else is billed by this script."
+  echo
   echo "Re-run as: CONFIRM_PAID_RUN=yes ./launch-test.sh"
   exit 1
 fi
 
-: "${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY, or run 'ant auth login' and unset this check}"
+source ./_api.sh
 
-# Build the request body with python3 so the rubric file is embedded verbatim —
-# no heredoc indentation or YAML-escaping hazards.
 BODY=$(python3 - "$AGENT_ID" "$ENV_ID" "$STORE_ID" <<'PY'
 import json, sys, pathlib
 agent_id, env_id, store_id = sys.argv[1:4]
@@ -44,11 +44,11 @@ print(json.dumps({
             "fence contractors, aiming for five but never relaxing the verification bar to "
             "reach that number. For each verified prospect, produce a prospect brief, one "
             "personalized first-contact message, two follow-up drafts, and discovery-call "
-            "questions - all as drafts, none sent. Produce prospects.csv with atomic "
-            "columns, research-log.csv covering every company touched including rejects, "
+            "questions - all drafts, none sent. Produce prospects.csv with atomic columns, "
+            "research-log.csv covering every company touched including rejects, "
             "ghl-import-mapping.md, daily-brief.md ranking the prospects with the evidence "
             "behind each ranking, and run-log.md. Contact nobody: public search and reading "
-            "public pages only, no outreach, no forms, no signups, no purchases."
+            "public pages only - no outreach, no forms, no signups, no purchases."
         ),
         "rubric": {"type": "text", "content": pathlib.Path("rubric.md").read_text()},
         "max_iterations": 5,
@@ -57,9 +57,11 @@ print(json.dumps({
 PY
 )
 
-SID=$(printf '%s' "$BODY" | ant beta:sessions create --transform id -r)
+SID=$(api POST /sessions "$BODY" | field id)
 
 echo "Session: $SID"
+echo "$SID" > .last-session
 echo "Watch live: https://platform.claude.com/workspaces/<YOUR_WORKSPACE>/sessions/$SID"
 echo
-ant beta:sessions:events stream --session-id "$SID"
+echo "Poll status:  ./watch.sh"
+echo "When idle:    ./fetch-results.sh $SID"

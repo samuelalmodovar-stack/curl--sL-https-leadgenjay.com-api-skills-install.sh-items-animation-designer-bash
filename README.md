@@ -31,10 +31,36 @@ review. Until then treat every row as an intention.
 | `fence-prospecting.agent.yaml` | Agent: model, tool surface, system prompt |
 | `fence-prospecting.environment.yaml` | Sandbox: cloud, deny-by-default container egress |
 | `rubric.md` | Graded criteria for the first test |
+| `_api.sh` | Shared curl/python helpers. Sourced, never run directly |
 | `setup.sh` | One-time: creates agent, environment, datastore → `.ids.env`. Not billable |
 | `launch-test.sh` | The paid run. Requires `CONFIRM_PAID_RUN=yes` |
+| `watch.sh` | Polls a session until it stops, and says why it stopped |
 | `fetch-results.sh` | After the run: actual cost + downloads every deliverable |
+| `update-agent.sh` | Applies a YAML edit as a new version of the existing agent |
 | `ghl-import-mapping.md` | Proposed CSV → GoHighLevel mapping, unverified against a live location |
+
+## Requirements
+
+`curl` and `python3` with pyyaml. No CLI and no SDK — the scripts call the REST API
+directly, so there is nothing to install beyond pyyaml if it's missing
+(`python3 -m pip install --user pyyaml`).
+
+## Authentication
+
+Run these from your own terminal with a dedicated API key exported in that shell:
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Scope the key to the workspace these agents should live in, and keep it to this use so it
+can be revoked on its own.
+
+Running the scripts inside a Claude Code cloud session was considered and rejected. The
+secure mechanism there — **API credentials**, where the key stays outside the sandbox and is
+attached at egress — explicitly excludes `api.anthropic.com`, so the only route would be a
+plain environment variable that the session and anyone else using that environment can read.
+A local shell keeps the key off that surface entirely.
 
 ## Tool surface (what the agent can actually do)
 
@@ -54,5 +80,6 @@ refused.
 
 1. `./setup.sh` — creates the three objects, writes `.ids.env`. No charge.
 2. `CONFIRM_PAID_RUN=yes ./launch-test.sh` — one session, $8.00 cap.
-3. `./fetch-results.sh <session_id>` — actual cost and deliverables.
+3. `./watch.sh` — poll until it stops, and see why.
+4. `./fetch-results.sh` — actual cost and deliverables.
 4. Review. Then, and only then, decide on GoHighLevel, the recurring schedule, and its cap.

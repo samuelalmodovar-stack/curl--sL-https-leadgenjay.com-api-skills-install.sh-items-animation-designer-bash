@@ -57,9 +57,12 @@ would be simpler without it.
 | `fence-prospecting.agent.yaml` | Agent: model, tool surface, system prompt |
 | `fence-prospecting.environment.yaml` | Sandbox: cloud, deny-by-default container egress |
 | `rubric.md` | Graded criteria for the first test run |
+| `_api.sh` | Shared curl/python helpers. Sourced, never run directly |
 | `setup.sh` | One-time: creates agent, environment, datastore → `.ids.env`. Not billable |
 | `launch-test.sh` | The paid run. Guarded by `CONFIRM_PAID_RUN=yes` |
+| `watch.sh` | Polls a session until it stops, and reports why |
 | `fetch-results.sh` | Post-run: actual `list_cost` + downloads deliverables |
+| `update-agent.sh` | Applies a YAML edit as a new agent version |
 | `ghl-import-mapping.md` | Proposed CSV → GoHighLevel mapping, unverified against a live account |
 
 `.ids.env` and `deliverables/` are gitignored. `.ids.env` holds the agent, environment, and
@@ -68,12 +71,15 @@ memory-store IDs — treat it as the one piece of local state that matters.
 ## Working conventions
 
 - **Agents are created once, not per run.** `setup.sh` refuses to run twice. To change the
-  agent, edit the YAML and `ant beta:agents update --agent-id "$AGENT_ID" --version N`,
-  which creates a new version rather than a new agent.
-- **Credentials never enter a prompt, a file, or chat.** Authentication is `ant auth login`
-  in the owner's own terminal, or `ANTHROPIC_API_KEY` set in the Claude Code environment
-  settings. When GoHighLevel is eventually connected, its token goes in a vault credential —
-  never in the agent YAML, the system prompt, or a session event.
+  agent, edit the YAML and run `./update-agent.sh`, which creates a new version of the same
+  agent rather than a second agent.
+- **Plain curl + python3, deliberately.** No `ant` CLI, no SDK. Don't add a dependency to
+  these scripts; the owner runs them from a local shell and nothing should need installing.
+- **Credentials never enter a prompt, a file, or chat.** `ANTHROPIC_API_KEY` is exported in
+  the owner's own terminal. Don't propose putting it in a cloud environment variable: the
+  secure egress-injection mechanism excludes `api.anthropic.com`, so that route would make
+  the key readable inside the session. When GoHighLevel is eventually connected, its token
+  goes in a vault credential — never in the agent YAML, the system prompt, or a session event.
 - **Adding an MCP server is two changes, not one.** Declare it in the agent's `mcp_servers`
   plus an `mcp_toolset` entry, *and* set `allow_mcp_servers: true` in the environment's
   `limited` networking block. Miss the second and MCP tool calls fail silently.
