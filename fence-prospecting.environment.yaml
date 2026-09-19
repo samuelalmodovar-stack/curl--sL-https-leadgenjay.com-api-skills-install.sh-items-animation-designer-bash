@@ -1,0 +1,15 @@
+name: fence-prospecting-cloud
+config:
+  type: cloud
+  # Deny-by-default container egress. Nothing is allow-listed: with bash disabled the
+  # sandbox has no tool that needs egress, and web_search / web_fetch run on Anthropic's
+  # servers rather than in the container, so they are unaffected by this setting.
+  #
+  # When the GoHighLevel MCP server is connected (after the first test is reviewed), this
+  # must become:
+  #   networking:
+  #     type: limited
+  #     allow_mcp_servers: true
+  # Otherwise MCP tool calls fail silently.
+  networking:
+    type: limited
