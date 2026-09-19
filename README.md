@@ -19,7 +19,8 @@ entitlements, Managed Agents availability, or model access.
 | Four-part verification bar for new prospects | Yes | **No** |
 | Summit as an existing-client reference record, no outreach | Yes | **No** |
 | Deliverables: prospects.csv, research-log.csv, briefs, drafts, daily brief, run log | Yes | **No** |
-| Persistent datastore (offer brief, partial exclusions, references, history) | Yes | **No** |
+| Reference store, attached read-only (brief, exclusions, existing-client records) | Yes | **No** |
+| Research-history store, attached read-write (dedupe + disposition history) | Yes | **No** |
 | Prospecting exclusions (2 confirmed: SSM, Drone Syndrome Media) | Yes | **No** |
 | $8.00 session cap | Yes | **No** |
 | GoHighLevel connection | **No — deferred until the test is reviewed** | No |
@@ -85,6 +86,22 @@ review — a call judged safe runs before anyone sees it. And a reduced outbound
 zero: a URL can act on the site that serves it. The system prompt forbids action URLs
 (confirmation, unsubscribe, checkout, booking, submission), and `run-log.md` must record
 anything blocked, denied, or refused rather than working around it.
+
+## Two memory stores, on purpose
+
+The agent reads untrusted third-party web pages. A memory store attached `read_write` is
+therefore an injection target: content fetched from a page could write into it, and a later
+session would read that back as trusted memory. So the offer brief, the prospecting
+exclusions, and Summit's existing-client designation live in a **reference store attached
+`read_only`** — the agent cannot alter them, and changes are made through the API instead.
+Only the **research-history store** is `read_write`, because deduplication needs it.
+
+## Beta headers
+
+Memory store and memory endpoints take `agent-memory-2026-07-22`. Agents, environments, and
+sessions — including attaching a memory store to a session — take
+`managed-agents-2026-04-01`. **Sending both on a memory-store request returns HTTP 400.**
+`agent.py` routes the header by endpoint in `beta_for()` and refuses to combine them.
 
 ## Sequence
 

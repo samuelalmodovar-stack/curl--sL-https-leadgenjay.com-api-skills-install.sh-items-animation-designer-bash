@@ -29,7 +29,12 @@ ENV_YAML = ROOT / "fence-prospecting.environment.yaml"
 RUBRIC = ROOT / "rubric.md"
 
 BASE = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+
+# Beta headers are NOT interchangeable and must never be combined on one request.
+# Agents, environments, sessions (including attaching a memory store to a session):
 BETA = "managed-agents-2026-04-01"
+# Memory store and memory endpoints. Sending this together with BETA returns HTTP 400.
+MEMORY_BETA = "agent-memory-2026-07-22"
 FILES_BETA = f"{BETA},files-api-2025-04-14"
 
 # $8.00, in minor units as an integer string — the API rejects decimal forms.
@@ -56,7 +61,20 @@ def api_key():
     return key
 
 
-def request(method, path, body=None, beta=BETA, query=None):
+def beta_for(path, override=None):
+    """Pick the beta header by endpoint family, so the two can never be combined."""
+    if path.startswith("/memory_stores"):
+        if override and "managed-agents" in override:
+            raise ApiError(
+                f"refusing to send '{override}' to {path} — memory store requests take "
+                f"{MEMORY_BETA} alone; combining the two returns HTTP 400"
+            )
+        return override or MEMORY_BETA
+    return override or BETA
+
+
+def request(method, path, body=None, beta=None, query=None):
+    beta = beta_for(path, beta)
     url = f"{BASE}/v1{path}"
     if query:
         url += "?" + urllib.parse.urlencode(query)
@@ -122,7 +140,7 @@ def money(minor, currency=""):
 
 # --------------------------------------------------------------------------- setup
 
-SEEDS = {
+REFERENCE_SEEDS = {
     "/exclusions/README.md": """PARTIAL exclusion information — user-confirmed entries only.
 
 This has NOT been reconciled against the CRM. It is not a complete list of companies that
@@ -166,6 +184,19 @@ Voice: direct, practical, conversational, natural contractions, only substantiat
 Samuel owns sales calls, closing, campaign approval, client relationships, and delivery.""",
 }
 
+RESEARCH_SEED = {
+    "/README.md": """Research history — one record per company considered, written by sessions.
+
+Record every company: verified, rejected, incomplete, excluded, and reference records.
+Deduplicate by normalized company domain and business identity. Revisit an incomplete
+record only with a stated reason rather than rediscovering it as new.
+
+Keep research, qualification, and contact dispositions separate. A draft is never a contact.
+
+Exclusions, existing-client references, and the offer brief are NOT here — they live in the
+read-only reference store and are changed through the API, not by a session."""
+}
+
 
 def cmd_setup(args):
     if IDS_FILE.exists():
@@ -182,36 +213,66 @@ def cmd_setup(args):
     env = request("POST", "/environments", load_yaml(ENV_YAML))
     print(f"    {env['id']}")
 
-    print("==> Creating persistent datastore")
-    store = request(
+    # Two stores on purpose. The agent reads untrusted web pages, so a prompt injection
+    # could otherwise write to the exclusions or Summit's designation and a later session
+    # would read that back as trusted memory. Reference material is attached read_only and
+    # is only ever changed through the API.
+    print("==> Creating reference store (attached read-only)")
+    ref = request(
         "POST",
         "/memory_stores",
         {
-            "name": "Samuel Scales Marketing - Pipeline",
+            "name": "Samuel Scales Marketing - Reference",
             "description": (
-                "Offer brief, partial user-confirmed exclusions, existing-client reference "
-                "records, and the research history for every company already considered "
-                "(verified, rejected, incomplete, excluded, reference). Check before "
-                "researching or including any company. The exclusion information is NOT "
-                "reconciled against the CRM and is not a complete list of who must be "
-                "excluded."
+                "Offer brief, partial user-confirmed prospecting exclusions, and "
+                "existing-client reference records including Summit Fencing LLC. Read this "
+                "before researching or including any company. Read-only: it is maintained "
+                "outside the session. The exclusion information is NOT reconciled against "
+                "the CRM and is not a complete list of who must be excluded."
             ),
         },
     )
-    print(f"    {store['id']}")
+    print(f"    {ref['id']}")
 
-    print("==> Seeding the datastore")
-    for path, content in SEEDS.items():
+    print("==> Creating research-history store (attached read-write)")
+    hist = request(
+        "POST",
+        "/memory_stores",
+        {
+            "name": "Samuel Scales Marketing - Research History",
+            "description": (
+                "One record per company considered — verified, rejected, incomplete, "
+                "excluded, reference — so later runs neither repeat the research nor "
+                "re-approach a company. Deduplicate by normalized company domain and "
+                "business identity. Research, qualification, and contact dispositions stay "
+                "separate."
+            ),
+        },
+    )
+    print(f"    {hist['id']}")
+
+    print("==> Seeding the reference store")
+    for path, content in REFERENCE_SEEDS.items():
         request(
-            "POST",
-            f"/memory_stores/{store['id']}/memories",
-            {"path": path, "content": content},
+            "POST", f"/memory_stores/{ref['id']}/memories", {"path": path, "content": content}
+        )
+        print(f"    seeded {path}")
+
+    print("==> Seeding the research-history store")
+    for path, content in RESEARCH_SEED.items():
+        request(
+            "POST", f"/memory_stores/{hist['id']}/memories", {"path": path, "content": content}
         )
         print(f"    seeded {path}")
 
     IDS_FILE.write_text(
         json.dumps(
-            {"agent_id": agent["id"], "environment_id": env["id"], "store_id": store["id"]},
+            {
+                "agent_id": agent["id"],
+                "environment_id": env["id"],
+                "reference_store_id": ref["id"],
+                "history_store_id": hist["id"],
+            },
             indent=2,
         )
         + "\n"
@@ -252,17 +313,28 @@ def session_body(ids):
         "resources": [
             {
                 "type": "memory_store",
-                "memory_store_id": ids["store_id"],
+                "memory_store_id": ids["reference_store_id"],
+                "access": "read_only",
+                "instructions": (
+                    "Read this before researching or including any company: the offer brief, "
+                    "the partial prospecting exclusions, and the existing-client references. "
+                    "Summit Fencing LLC is an existing-client reference here - not an "
+                    "exclusion and not a prospect. The exclusion information is not complete "
+                    "and not CRM-reconciled; never describe it as either. This store is "
+                    "read-only by design: propose changes in run-log.md instead of writing."
+                ),
+            },
+            {
+                "type": "memory_store",
+                "memory_store_id": ids["history_store_id"],
                 "access": "read_write",
                 "instructions": (
-                    "Offer brief, partial exclusions, existing-client references, and "
-                    "research history. Check before researching or including any company, "
-                    "and record every company you consider. Summit Fencing LLC is an "
-                    "existing-client reference, not an exclusion and not a prospect. The "
-                    "exclusion information is not complete and not CRM-reconciled - never "
-                    "describe it as either."
+                    "Your research history. Check it before researching a company to avoid "
+                    "repeating work or re-approaching anyone, and record every company you "
+                    "consider here - verified, rejected, incomplete, excluded, reference - "
+                    "with its disposition and reason."
                 ),
-            }
+            },
         ],
         "initial_events": [
             {
