@@ -1,2 +1,6 @@
+.ids.json
 .ids.env
+.last-session
 deliverables/
+outputs/
+__pycache__/
