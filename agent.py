@@ -40,6 +40,14 @@ FILES_BETA = f"{BETA},files-api-2025-04-14"
 # $8.00, in minor units as an integer string — the API rejects decimal forms.
 BUDGET_CENTS = "800"
 
+# Samuel's workspace. Sent as anthropic-workspace-id on every request, which a key that
+# is not scoped to a single workspace requires. A workspace-scoped key resolves on its
+# own and does not need it; sending the matching id alongside one is harmless, but an id
+# naming a DIFFERENT workspace than the key belongs to is an error the API will reject.
+# Override with ANTHROPIC_WORKSPACE_ID, or set that to an empty string to send no header.
+# Not a secret — a workspace id is an identifier, not a credential.
+WORKSPACE_ID = "wrkspc_01RTTcHftdXyQfx9XG87seJU"
+
 
 # Filled in from response headers as calls are made — not configuration.
 RESOLVED = {}
@@ -88,8 +96,10 @@ def request(method, path, body=None, beta=None, query=None):
     req.add_header("anthropic-version", "2023-06-01")
     req.add_header("anthropic-beta", beta)
     # Required on every request for a key that is not scoped to one workspace; a
-    # single-workspace key needs no header and resolves on its own.
-    workspace = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+    # single-workspace key needs no header and resolves on its own. Defaults to
+    # WORKSPACE_ID; ANTHROPIC_WORKSPACE_ID overrides it, and setting that to an empty
+    # string suppresses the header.
+    workspace = os.environ.get("ANTHROPIC_WORKSPACE_ID", WORKSPACE_ID)
     if workspace:
         req.add_header("anthropic-workspace-id", workspace)
     if data:
@@ -108,13 +118,22 @@ def request(method, path, body=None, beta=None, query=None):
         try:
             err = json.loads(raw).get("error") or {}
             msg = err.get("message", raw[:600])
-            if "anthropic-workspace-id" in msg and not workspace:
-                msg += (
-                    "\n\n  This key is not scoped to a single workspace, so every request "
-                    "needs the workspace id.\n  Either set ANTHROPIC_WORKSPACE_ID "
-                    "(Console > Settings > Workspaces, ID column),\n  or create a key "
-                    "scoped to one workspace, which needs no header at all."
-                )
+            if "anthropic-workspace-id" in msg or "workspace" in msg.lower():
+                if workspace:
+                    msg += (
+                        f"\n\n  This request sent workspace id {workspace}. If the key "
+                        "belongs to a different workspace,\n  set ANTHROPIC_WORKSPACE_ID to "
+                        "the right one (Console > Settings > Workspaces, ID column),\n  or "
+                        'set it to an empty string ("") to send no workspace header at all.'
+                    )
+                else:
+                    msg += (
+                        "\n\n  No workspace id was sent. If this key is not scoped to a "
+                        "single workspace, every request\n  needs one: set "
+                        "ANTHROPIC_WORKSPACE_ID (Console > Settings > Workspaces, ID "
+                        "column),\n  or create a key scoped to one workspace, which needs "
+                        "no header at all."
+                    )
             raise ApiError(f"HTTP {e.code} {err.get('type', '?')}: {msg}") from None
         except json.JSONDecodeError:
             raise ApiError(f"HTTP {e.code}: {raw[:600]}") from None

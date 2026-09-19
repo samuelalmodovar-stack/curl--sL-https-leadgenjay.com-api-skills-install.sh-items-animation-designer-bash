@@ -75,9 +75,30 @@ Create the key at **Console → Settings → API keys → Create key**. Recommen
   `anthropic-workspace-id` header on *every* request, or the API returns a 400. Scoping the
   key removes that requirement entirely and limits what a leaked key can reach.
 
-If you do use a multi-workspace key, set `ANTHROPIC_WORKSPACE_ID` alongside the key (the ID is
-in the **ID** column of Console → Settings → Workspaces) and `agent.py` will send the header.
 `Disable` on a key is reversible; `Delete` is permanent.
+
+## Workspace
+
+The workspace id is committed as `WORKSPACE_ID` in `agent.py` and sent as the
+`anthropic-workspace-id` header on every request, so a multi-workspace key needs no extra
+setup:
+
+```
+wrkspc_01RTTcHftdXyQfx9XG87seJU
+```
+
+A workspace id is an identifier, not a credential — it appears in Console URLs and is safe to
+commit. Override it per shell when you need a different one, or suppress the header entirely:
+
+```powershell
+$env:ANTHROPIC_WORKSPACE_ID = "wrkspc_..."   # use a different workspace
+$env:ANTHROPIC_WORKSPACE_ID = ""             # send no workspace header
+```
+
+A workspace-scoped key resolves on its own and does not need the header. Sending the matching
+id alongside one is harmless, but an id naming a **different** workspace than the key belongs
+to is rejected — if that happens, `agent.py` prints which id it sent. This id has not been
+validated against the API, because no key is available to validate it with.
 
 Running this inside a Claude Code cloud session was considered and rejected: the secure
 mechanism there — API credentials, where the key stays outside the sandbox and is attached at
