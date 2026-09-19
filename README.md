@@ -65,8 +65,19 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."
 export ANTHROPIC_API_KEY=sk-ant-...   # macOS / Linux
 ```
 
-Use a dedicated key scoped to the workspace these agents should live in, so it can be revoked
-on its own.
+Create the key at **Console → Settings → API keys → Create key**. Recommended choices:
+
+- **Linked account:** yourself (a personal key) — this is your own tooling.
+- **Expiration:** 30 days for the test phase. Expiration is fixed at creation and cannot be
+  changed later; you get a warning email 7 days out. Pick **Never** only if you keep the key
+  in a secrets manager.
+- **Scope it to a single workspace.** A key that is not workspace-scoped must send an
+  `anthropic-workspace-id` header on *every* request, or the API returns a 400. Scoping the
+  key removes that requirement entirely and limits what a leaked key can reach.
+
+If you do use a multi-workspace key, set `ANTHROPIC_WORKSPACE_ID` alongside the key (the ID is
+in the **ID** column of Console → Settings → Workspaces) and `agent.py` will send the header.
+`Disable` on a key is reversible; `Delete` is permanent.
 
 Running this inside a Claude Code cloud session was considered and rejected: the secure
 mechanism there — API credentials, where the key stays outside the sandbox and is attached at

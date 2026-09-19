@@ -41,6 +41,10 @@ FILES_BETA = f"{BETA},files-api-2025-04-14"
 BUDGET_CENTS = "800"
 
 
+# Filled in from response headers as calls are made — not configuration.
+RESOLVED = {}
+
+
 class ApiError(RuntimeError):
     pass
 
@@ -83,19 +87,35 @@ def request(method, path, body=None, beta=None, query=None):
     req.add_header("x-api-key", api_key())
     req.add_header("anthropic-version", "2023-06-01")
     req.add_header("anthropic-beta", beta)
+    # Required on every request for a key that is not scoped to one workspace; a
+    # single-workspace key needs no header and resolves on its own.
+    workspace = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+    if workspace:
+        req.add_header("anthropic-workspace-id", workspace)
     if data:
         req.add_header("content-type", "application/json")
     try:
         with urllib.request.urlopen(req) as resp:
+            # The API reports which workspace the credential resolved to. Remember it so
+            # the Console session link can be built without guessing.
+            seen = resp.headers.get("anthropic-workspace-id")
+            if seen:
+                RESOLVED["workspace_id"] = seen
             return json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
         # urllib raises on 4xx/5xx, so the API's own message is in the body.
         raw = e.read().decode(errors="replace")
         try:
             err = json.loads(raw).get("error") or {}
-            raise ApiError(
-                f"HTTP {e.code} {err.get('type', '?')}: {err.get('message', raw[:600])}"
-            ) from None
+            msg = err.get("message", raw[:600])
+            if "anthropic-workspace-id" in msg and not workspace:
+                msg += (
+                    "\n\n  This key is not scoped to a single workspace, so every request "
+                    "needs the workspace id.\n  Either set ANTHROPIC_WORKSPACE_ID "
+                    "(Console > Settings > Workspaces, ID column),\n  or create a key "
+                    "scoped to one workspace, which needs no header at all."
+                )
+            raise ApiError(f"HTTP {e.code} {err.get('type', '?')}: {msg}") from None
         except json.JSONDecodeError:
             raise ApiError(f"HTTP {e.code}: {raw[:600]}") from None
     except urllib.error.URLError as e:
@@ -363,7 +383,8 @@ def cmd_launch(args):
     LAST_SESSION.write_text(sid + "\n")
     print(f"Session:  {sid}")
     print(f"Status:   {session.get('status')}")
-    print(f"Watch:    https://platform.claude.com/workspaces/<YOUR_WORKSPACE>/sessions/{sid}")
+    ws = RESOLVED.get("workspace_id") or "<YOUR_WORKSPACE>"
+    print(f"Watch:    https://platform.claude.com/workspaces/{ws}/sessions/{sid}")
     print("\nPoll:     py agent.py watch")
     print("When it stops: py agent.py results")
 
