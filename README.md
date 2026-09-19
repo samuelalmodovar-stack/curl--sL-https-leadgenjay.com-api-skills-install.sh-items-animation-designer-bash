@@ -117,7 +117,7 @@ sessions — including attaching a memory store to a session — take
 ## Sequence
 
 ```powershell
-py agent.py setup              # creates the three objects -> .ids.json. No model cost.
+py agent.py setup              # creates agent + environment + 2 stores -> .ids.json. No model cost.
 py agent.py launch --confirm   # BILLABLE: one session, $8.00 cap
 py agent.py watch              # poll until it stops, and see why it stopped
 py agent.py results            # actual cost + download deliverables
